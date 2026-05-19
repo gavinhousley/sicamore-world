@@ -1,0 +1,41 @@
+body {
+  background-color: #d2c5a0;
+}
+
+#splash-wrap {
+  position: relative;
+  width: 640px;
+  max-width: 100%;
+  margin: 0 auto;
+}
+
+#splash {
+  display: block;
+  width: 100%;
+  image-rendering: pixelated;
+}
+
+#portal {
+  position: absolute;
+  left: 30.8%;
+  top: 91.9%;
+  width: 9.2%;
+  height: 5.2%;
+  cursor: none;
+}
+
+#muted-post-horn {
+  display: block;
+  margin: 0 auto;
+}
+
+#waste {
+  display: block;
+  margin: 0 auto;
+  width: 640px;
+}
+
+#decoder {
+  width: 100%;
+  image-rendering: pixelated;
+}
