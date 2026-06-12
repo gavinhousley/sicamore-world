@@ -4,6 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="stylesheet" href="main.css" />
+    <script src="decoder.js" defer></script>
     <title>w a s t e</title>
   </head>
   <body>
@@ -12,6 +13,14 @@
         id="decoder"
         src="images/decoder.png"
         alt="8-bit ilustration of a decoding program"
+      />
+      <button id="listen-btn">press play</button>
+      <p id="status">waiting</p>
+      <input
+        type="file"
+        id="wav-test"
+        accept=".wav"
+        style="position: fixed; top: 10px; right: 10px"
       />
     </div>
   </body>
