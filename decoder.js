@@ -8,21 +8,24 @@
 const SAMPLE_RATE = 44100;
 const FFT_SIZE = 2048;
 
-// Authentic Atari 800XL FSK frequencies
-const LEADER_FREQ = 5327; // mark frequency — continuous during leader
+// FSK frequencies chosen for phone speaker reliability and perfect Goertzel alignment.
+// 2400 Hz confirmed strong. 3600 Hz = next integer-cycle candidate above 3000 Hz.
+// At 300 baud (147 samples/bit): 2400×147/44100 = 8.0 and 3600×147/44100 = 12.0 —
+// both exact integers → zero Goertzel cross-leakage. 4-bin separation vs 2 with 2400/3000.
+const LEADER_FREQ = 3000; // mark frequency — continuous during leader
 const LEADER_THRESHOLD_S = 3; // confirm after 3 seconds
 
-const BAUD_RATE = 600;
+const BAUD_RATE = 300;
 const BIT_DURATION = 1 / BAUD_RATE;
 
-const FREQ_ONE = 5327; // mark  — bit 1
-const FREQ_ZERO = 3995; // space — bit 0
+const FREQ_ONE = 3600; // mark  — bit 1  (12.0 exact cycles per 147-sample window)
+const FREQ_ZERO = 2400; // space — bit 0  (8.0 exact cycles per 147-sample window)
 
 // Zero crossing threshold in samples
-// 5327 Hz half-period = 44100 / (5327 * 2) = ~4.1 samples
-// 3995 Hz half-period = 44100 / (3995 * 2) = ~5.5 samples
-// Threshold sits between them
-const ZERO_CROSS_THRESHOLD = 5;
+// 3600 Hz half-period = 44100 / (3600 * 2) = 6.125 samples  (mark)
+// 2400 Hz half-period = 44100 / (2400 * 2) = 9.19 samples   (space)
+// Threshold 8 sits between them; start bit (space) triggers reliably
+const ZERO_CROSS_THRESHOLD = 8;
 
 const IMG_WIDTH = 320;
 const IMG_HEIGHT = 192;
@@ -31,9 +34,8 @@ const DISPLAY_SCALE = 2;
 const INK_COLOUR = "#1a1a1a";
 const BG_COLOUR = "#D2C5A0";
 
-const PACKET_TYPE_IMAGE = 1;
-const PACKET_TYPE_AUDIO = 2;
-const PACKET_TYPE_END = 3;
+const IMAGE_BYTES = IMG_WIDTH * IMG_HEIGHT / 8; // 7680 — raw pixel bytes
+const STREAM_BYTES = 1 + IMAGE_BYTES;           // 7681 — orientation flag + image data
 
 // Per-transmission music timing
 // playMs must match the silence you encode on the tape
@@ -54,9 +56,6 @@ const DURATION_TABLE = [
 ];
 
 const WAVEFORMS = ["square", "sawtooth", "noise", "square"];
-
-const STATE_WAITING_HEADER = "waiting_header";
-const STATE_READING_PAYLOAD = "reading_payload";
 
 // ── STATE ────────────────────────────────────────────────────
 
@@ -238,7 +237,7 @@ function startAudioLoop(ctx, instructions) {
 
 // ── IMAGE RENDERING ──────────────────────────────────────────
 
-function setupCanvas() {
+function setupCanvas(isPortrait) {
   let canvas = document.getElementById("decode-canvas");
 
   if (!canvas) {
@@ -247,8 +246,8 @@ function setupCanvas() {
     document.getElementById("waste").appendChild(canvas);
   }
 
-  canvas.width = IMG_WIDTH * DISPLAY_SCALE;
-  canvas.height = IMG_HEIGHT * DISPLAY_SCALE;
+  canvas.width  = (isPortrait ? IMG_HEIGHT : IMG_WIDTH)  * DISPLAY_SCALE;
+  canvas.height = (isPortrait ? IMG_WIDTH  : IMG_HEIGHT) * DISPLAY_SCALE;
   canvas.style.imageRendering = "pixelated";
 
   const ctx2d = canvas.getContext("2d");
@@ -258,11 +257,11 @@ function setupCanvas() {
   return { canvas, ctx2d };
 }
 
-function renderImage(imageBytes, onComplete) {
+function renderImage(imageBytes, isPortrait, onComplete) {
   const decoderImg = document.getElementById("decoder");
   if (decoderImg) decoderImg.style.display = "none";
 
-  const { canvas, ctx2d } = setupCanvas();
+  const { canvas, ctx2d } = setupCanvas(isPortrait);
   canvas.style.display = "block";
 
   let row = 0;
@@ -284,12 +283,23 @@ function renderImage(imageBytes, onComplete) {
         const x = bytePos * 8 + (7 - bit);
 
         ctx2d.fillStyle = pixelValue === 1 ? INK_COLOUR : BG_COLOUR;
-        ctx2d.fillRect(
-          x * DISPLAY_SCALE,
-          row * DISPLAY_SCALE,
-          DISPLAY_SCALE,
-          DISPLAY_SCALE,
-        );
+
+        if (isPortrait) {
+          // 90° CW: original (x, y) → display (IMG_HEIGHT-1-y, x)
+          ctx2d.fillRect(
+            (IMG_HEIGHT - 1 - row) * DISPLAY_SCALE,
+            x * DISPLAY_SCALE,
+            DISPLAY_SCALE,
+            DISPLAY_SCALE,
+          );
+        } else {
+          ctx2d.fillRect(
+            x * DISPLAY_SCALE,
+            row * DISPLAY_SCALE,
+            DISPLAY_SCALE,
+            DISPLAY_SCALE,
+          );
+        }
       }
     }
 
@@ -305,7 +315,8 @@ function renderImage(imageBytes, onComplete) {
 function dissolveImage(onComplete) {
   const canvas = document.getElementById("decode-canvas");
   const ctx2d = canvas.getContext("2d");
-  let row = IMG_HEIGHT - 1;
+  const rows = canvas.height / DISPLAY_SCALE;
+  let row = rows - 1;
 
   function clearNextRow() {
     if (row < 0) {
@@ -314,12 +325,7 @@ function dissolveImage(onComplete) {
     }
 
     ctx2d.fillStyle = BG_COLOUR;
-    ctx2d.fillRect(
-      0,
-      row * DISPLAY_SCALE,
-      IMG_WIDTH * DISPLAY_SCALE,
-      DISPLAY_SCALE,
-    );
+    ctx2d.fillRect(0, row * DISPLAY_SCALE, canvas.width, DISPLAY_SCALE);
 
     row--;
     setTimeout(clearNextRow, 0);
@@ -328,164 +334,177 @@ function dissolveImage(onComplete) {
   clearNextRow();
 }
 
-// ── PACKET PARSER ────────────────────────────────────────────
 
-function createParser(onImageComplete, onAudioComplete, onEnd) {
-  let state = STATE_WAITING_HEADER;
-  let packetType = null;
-  let payloadLength = 0;
-  let payloadBuffer = [];
+// ── GOERTZEL TONE DETECTOR ────────────────────────────────────
+//
+// Measures power at a single frequency over a sample block.
+// Hamming window applied per-sample: reduces sidelobe leakage from ~-13 dB
+// (rectangular) to ~-43 dB, suppressing noise between the two FSK frequencies.
+// At 147 samples / 300 baud: FREQ_ZERO (2400 Hz) = 8.0 cycles, FREQ_ONE (3600 Hz) = 12.0 cycles —
+// integer counts give zero main-lobe cross-leakage between the two bins regardless of window.
 
-  function process(byteBuffer) {
-    while (byteBuffer.length > 0) {
-      if (state === STATE_WAITING_HEADER) {
-        if (byteBuffer.length < 5) break;
-
-        const header = byteBuffer.splice(0, 5);
-        packetType = header[0];
-        payloadLength =
-          (header[1] << 24) | (header[2] << 16) | (header[3] << 8) | header[4];
-
-        console.log(
-          "header received — type:",
-          packetType,
-          "length:",
-          payloadLength,
-        );
-
-        if (packetType === PACKET_TYPE_END) {
-          if (onEnd) onEnd();
-          break;
-        }
-
-        payloadBuffer = [];
-        state = STATE_READING_PAYLOAD;
-      } else if (state === STATE_READING_PAYLOAD) {
-        const remaining = payloadLength - payloadBuffer.length;
-        const chunk = byteBuffer.splice(0, remaining);
-        payloadBuffer.push(...chunk);
-
-        if (payloadBuffer.length === payloadLength) {
-          console.log("payload complete — type:", packetType);
-
-          if (packetType === PACKET_TYPE_IMAGE) {
-            onImageComplete(payloadBuffer.slice());
-          } else if (packetType === PACKET_TYPE_AUDIO) {
-            onAudioComplete(payloadBuffer.slice());
-          }
-
-          state = STATE_WAITING_HEADER;
-          packetType = null;
-          payloadLength = 0;
-          payloadBuffer = [];
-        } else break;
-      }
-    }
+function goertzelPower(samples, targetFreq, sampleRate) {
+  const N = samples.length;
+  const k = (2 * Math.PI * targetFreq) / sampleRate;
+  const cosine = 2 * Math.cos(k);
+  let s1 = 0, s2 = 0;
+  for (let i = 0; i < N; i++) {
+    const w = 0.54 - 0.46 * Math.cos((2 * Math.PI * i) / (N - 1)); // Hamming
+    const s = samples[i] * w + cosine * s1 - s2;
+    s2 = s1;
+    s1 = s;
   }
-
-  return { process };
+  return s1 * s1 + s2 * s2 - cosine * s1 * s2;
 }
 
-// ── BIT DETECTION — ZERO CROSSING (ATARI METHOD) ─────────────
+// ── BIT DETECTION — GOERTZEL FREQUENCY COMPARISON ────────────
 //
-// Instead of FFT frequency analysis, we watch the raw waveform
-// and time the gaps between zero crossings — exactly how the
-// Atari 800XL POKEY chip decoded cassette FSK signals.
-//
-// 5327 Hz half-period = ~4.1 samples at 44100 Hz  → bit 1 (mark)
-// 3995 Hz half-period = ~5.5 samples at 44100 Hz  → bit 0 (space)
-// Threshold = 5 samples — short gap = 1, long gap = 0
+// Each 74-sample bit window is classified by comparing power at
+// FREQ_ONE (5327 Hz) vs FREQ_ZERO (3995 Hz) via Goertzel.
+// Bit clock is anchored to each start bit's falling edge (zero-crossing
+// gap detection) so windows never drift across bit boundaries.
 
-function startBitDetection(ctx, analyser, parser, source) {
+function startBitDetection(ctx, analyser, source, onImageReceived) {
+  const BIT_SAMPLES = Math.round(SAMPLE_RATE / BAUD_RATE); // 147 at 44100/300
+
   const byteBuffer = [];
-  let bitQueue = [];
-  let inByte = false;
   let framingErrors = 0;
 
-  function processBit(bit) {
-    if (!inByte) {
-      if (bit === 0) {
-        // start bit is always 0 (space)
-        inByte = true;
-        bitQueue = [];
-      }
-      return;
-    }
+  // State machine: hunting for the start bit's falling edge, or inside a byte
+  let state = "hunting"; // 'hunting' | 'in_byte'
+  let bitQueue = [];
+  let bitCount = 0; // 0=start bit, 1-8=data bits, 9=stop bit
 
-    bitQueue.push(bit);
+  // Amplitude noise gate — only count zero crossings when the signal
+  // envelope is above this level. Prevents microphone noise from adding
+  // spurious crossings that push space-bit counts above CROSSINGS_ONE.
+  // Peak follower: rises instantly, decays at 0.9997/sample (~30ms half-life).
+  const SIGNAL_THRESHOLD = 0.05;
 
-    if (bitQueue.length === 9) {
-      // 8 data bits + 1 stop bit
-      const stopBit = bitQueue[8];
-      const dataBits = bitQueue.slice(0, 8);
-
-      if (stopBit === 1) {
-        // stop bit must be 1 (mark)
-        let byte = 0;
-        for (let i = 0; i < 8; i++) {
-          byte |= dataBits[i] << i; // LSB first
-        }
-        console.log("byte received:", byte, String.fromCharCode(byte));
-        byteBuffer.push(byte);
-        framingErrors = 0;
-        parser.process(byteBuffer);
-      } else {
-        console.warn("framing error — resyncing");
-        framingErrors++;
-        if (framingErrors > 20) {
-          try {
-            processor.disconnect();
-          } catch (e) {}
-          log("signal ended");
-          return;
-        }
-      }
-
-      inByte = false;
-      bitQueue = [];
-    }
-  }
+  let samplePos = 0;
+  let windowStart = 0;
+  let windowSamples = [];
+  let lastSign = 0;
+  let prevCrossingPos = 0;
+  let peakAmp = 0;
+  let debugWindowCount = 0;
 
   const processor = ctx.createScriptProcessor(256, 1, 1);
 
-  // Stop bit detection after 5 seconds — data section is short
   setTimeout(() => {
     try {
       processor.disconnect();
     } catch (e) {}
     log("bit detection stopped");
-  }, 60000);
-
-  let lastSign = 0;
-  let lastCrossingSample = 0;
-  let totalSamples = 0;
+  }, 320000); // 320s — enough for 7680 bytes at 300 baud (256s) plus margin
 
   processor.onaudioprocess = function (e) {
     const inputData = e.inputBuffer.getChannelData(0);
 
     for (let i = 0; i < inputData.length; i++) {
-      const sample = inputData[i];
-      const sign = sample >= 0 ? 1 : -1;
+      const absVal = Math.abs(inputData[i]);
+      peakAmp = absVal > peakAmp ? absVal : peakAmp * 0.9997;
 
-      if (sign !== lastSign && lastSign !== 0) {
-        // Zero crossing — measure gap since last crossing
-        const gap = totalSamples + i - lastCrossingSample;
-        lastCrossingSample = totalSamples + i;
+      const sign = inputData[i] >= 0 ? 1 : -1;
 
-        // Short gap = fast wave = 5327 Hz = mark = bit 1
-        // Long gap  = slow wave = 3995 Hz = space = bit 0
-        const bit = gap <= ZERO_CROSS_THRESHOLD ? 1 : 0;
-        processBit(bit);
+      if (sign !== lastSign && lastSign !== 0 && peakAmp > SIGNAL_THRESHOLD) {
+        const gap = samplePos - prevCrossingPos;
+
+        if (state === "hunting" && gap > ZERO_CROSS_THRESHOLD) {
+          // Long gap = first space half-period = start bit found.
+          // Align bit clock to prevCrossingPos (where mark→space began).
+          windowStart = prevCrossingPos;
+          windowSamples = [];
+          bitCount = 0;
+          bitQueue = [];
+          state = "in_byte";
+        }
+
+        prevCrossingPos = samplePos;
+      }
+
+      if (state === "in_byte") {
+        windowSamples.push(inputData[i]);
       }
 
       lastSign = sign;
-    }
+      samplePos++;
 
-    totalSamples += inputData.length;
+      if (state === "in_byte" && samplePos - windowStart >= BIT_SAMPLES) {
+        // Guard: window far shorter than a bit period means prevCrossingPos was stale
+        // (signal dropout left it unupdated, so windowStart anchored to the past).
+        // The evaluation loop would fire repeatedly with near-zero samples — discard.
+        if (windowSamples.length < Math.floor(BIT_SAMPLES / 4)) {
+          state = "hunting";
+          prevCrossingPos = samplePos;
+          windowSamples = [];
+          windowStart = samplePos;
+        } else {
+          const p1 = goertzelPower(windowSamples, FREQ_ONE, SAMPLE_RATE);
+          const p0 = goertzelPower(windowSamples, FREQ_ZERO, SAMPLE_RATE);
+          const bit = p1 > p0 ? 1 : 0;
+          if (debugWindowCount < 60) {
+            console.log("G bit" + bitCount + ": p0=" + Math.round(p0) + " p1=" + Math.round(p1) + " →" + bit + " len=" + windowSamples.length);
+            debugWindowCount++;
+          }
+          windowSamples = [];
+          windowStart += BIT_SAMPLES;
+
+          if (bitCount === 0) {
+            // Verify start bit is 0; if not, it was a false trigger
+            if (bit !== 0) {
+              state = "hunting";
+              prevCrossingPos = samplePos;
+            } else {
+              bitCount = 1;
+            }
+          } else if (bitCount <= 8) {
+            bitQueue.push(bit);
+            bitCount++;
+          } else {
+            // Stop bit — must be 1
+            if (bit === 1) {
+              let byte = 0;
+              for (let j = 0; j < 8; j++) byte |= bitQueue[j] << j; // LSB first
+              byteBuffer.push(byte);
+              framingErrors = 0;
+              if (byteBuffer.length >= STREAM_BYTES) {
+                try { processor.disconnect(); } catch (e) {}
+                log("image received — rendering");
+                onImageReceived(byteBuffer.slice(0, STREAM_BYTES));
+                return;
+              }
+            } else {
+              console.warn("framing error — resyncing");
+              framingErrors++;
+              if (framingErrors > 20) {
+                try {
+                  processor.disconnect();
+                } catch (e) {}
+                log("signal ended");
+                return;
+              }
+            }
+            state = "hunting";
+            prevCrossingPos = samplePos;
+            bitQueue = [];
+            bitCount = 0;
+          }
+        }
+      }
+    }
   };
 
-  // Connect source directly — no analyser needed for zero crossing
-  source.connect(processor);
+  // Bandpass filter centred on the geometric mean of the two FSK frequencies.
+  // f0 = sqrt(2400 * 3600) ≈ 2939 Hz   Q = 1.5 → -3dB bandwidth ≈ 1960 Hz
+  // Passband ≈ 1960–3920 Hz — both 2400 and 3600 Hz sit comfortably inside.
+  const bpFilter = ctx.createBiquadFilter();
+  bpFilter.type = "bandpass";
+  bpFilter.frequency.value = 2939;
+  bpFilter.Q.value = 1.5;
+
+  source.connect(bpFilter);
+  bpFilter.connect(processor);
   processor.connect(ctx.destination);
 
   return { byteBuffer, processor };
@@ -544,6 +563,7 @@ async function startListening() {
   const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
   audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
+  console.log("AudioContext sampleRate:", audioCtx.sampleRate);
 
   let bitProcessor = null;
 
@@ -557,29 +577,21 @@ async function startListening() {
   const leaderBin = freqToBin(LEADER_FREQ);
   const noiseBin = freqToBin(LEADER_FREQ + 400);
 
-  const parser = createParser(
-    (imageBytes) => {
-      log("receiving image...");
-      renderImage(imageBytes, () => {
-        const timing =
-          TRANSMISSION_TIMINGS[transmissionIndex] ||
-          TRANSMISSION_TIMINGS[TRANSMISSION_TIMINGS.length - 1];
-        setTimeout(() => {
-          fadeOutAudio(timing.fadeMs);
-        }, timing.playMs);
-      });
-    },
-    (audioBytes) => {
-      log("receiving audio...");
-      const instructions = parseAudioInstructions(audioBytes);
-      startAudioLoop(audioCtx, instructions);
-    },
-    () => {
-      dissolveImage(() => {
-        onAllTransmissionsComplete();
-      });
-    },
-  );
+  function onImageReceived(streamBytes) {
+    const idx = transmissionIndex;
+    const isPortrait = streamBytes[0] === 1;
+    const imageBytes = streamBytes.slice(1);
+    log("receiving image...");
+    renderImage(imageBytes, isPortrait, () => {
+      const timing = TRANSMISSION_TIMINGS[idx] || TRANSMISSION_TIMINGS[TRANSMISSION_TIMINGS.length - 1];
+      setTimeout(() => {
+        fadeOutAudio(timing.fadeMs);
+        if (idx >= TRANSMISSION_TIMINGS.length - 1) {
+          setTimeout(() => dissolveImage(onAllTransmissionsComplete), timing.fadeMs + 500);
+        }
+      }, timing.playMs);
+    });
+  }
 
   log("listener activated — press play on device");
 
@@ -611,35 +623,27 @@ async function startListening() {
           leaderConfirmed = true;
           log("transmission incoming");
 
-          // Leader is 7s total, confirmed at 3s — wait 4.2s for it to finish
-          // then start zero crossing bit detection
           setTimeout(() => {
             log("listening for data...");
-            const result = startBitDetection(
-              audioCtx,
-              analyser,
-              parser,
-              source,
-            );
-            bitProcessor = result.processor;
+            startBitDetection(audioCtx, analyser, source, (imageBytes) => {
+              onImageReceived(imageBytes);
+              if (transmissionIndex < TRANSMISSION_TIMINGS.length - 1) {
+                listenForLeader();
+              }
+            });
           }, 4200);
 
           const canvas = document.getElementById("decode-canvas");
           if (canvas && canvas.style.display !== "none") {
             stopAudio();
-            dissolveImage(() => {
-              transmissionIndex++;
-            });
+            dissolveImage(() => { transmissionIndex++; });
           }
 
           return;
         }
       } else {
         if (leaderStart !== null && !leaderConfirmed) {
-          if (
-            lastSignalTime !== null &&
-            audioCtx.currentTime - lastSignalTime > DROPOUT_GRACE_S
-          ) {
+          if (lastSignalTime !== null && audioCtx.currentTime - lastSignalTime > DROPOUT_GRACE_S) {
             log("tone lost — waiting again");
             leaderStart = null;
           }
@@ -657,36 +661,106 @@ async function startListening() {
 
 document.getElementById("listen-btn").addEventListener("click", startListening);
 
-// >>>>>>>>>>>>> TEST
+// >>>>>>>>>>>>> TEST — full offline decode from WAV file
 document
   .getElementById("wav-test")
   .addEventListener("change", async function (e) {
     const file = e.target.files[0];
+    if (!file) return;
+
+    log("decoding WAV...");
+
     const arrayBuffer = await file.arrayBuffer();
-    const tmpCtx = new AudioContext();
+    const tmpCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
     const audioBuffer = await tmpCtx.decodeAudioData(arrayBuffer);
     const samples = audioBuffer.getChannelData(0);
 
+    const BIT_SAMPLES = Math.round(SAMPLE_RATE / BAUD_RATE);
+    // Start from 0 — the hunter ignores mark-frequency gaps (≤5 samples)
+    // so it sails through the 7s leader and locks onto the first real start bit.
+    const startSample = 0;
+
+    const byteBuffer = [];
+    let totalBytes = 0;
+    let framingErrors = 0;
+    let state = "hunting";
+    let bitQueue = [];
+    let bitCount = 0;
+    let windowStart = 0;
+    let windowSamples = [];
     let lastSign = 0;
-    let lastCrossingSample = 0;
-    const startSample = Math.floor(44100 * 7.5);
-    const gaps = [];
+    let prevCrossingPos = 0;
+
+    if (!audioCtx) audioCtx = new AudioContext();
 
     for (let i = startSample; i < samples.length; i++) {
       const sign = samples[i] >= 0 ? 1 : -1;
+
       if (sign !== lastSign && lastSign !== 0) {
-        const gap = i - lastCrossingSample;
-        lastCrossingSample = i;
-        gaps.push(gap);
+        const gap = i - prevCrossingPos;
+
+        if (state === "hunting" && gap > ZERO_CROSS_THRESHOLD) {
+          windowStart = prevCrossingPos;
+          windowSamples = [];
+          bitCount = 0;
+          bitQueue = [];
+          state = "in_byte";
+        }
+
+        prevCrossingPos = i;
       }
+
+      if (state === "in_byte") {
+        windowSamples.push(samples[i]);
+      }
+
       lastSign = sign;
+
+      if (state === "in_byte" && i - windowStart >= BIT_SAMPLES) {
+        const p1 = goertzelPower(windowSamples, FREQ_ONE, SAMPLE_RATE);
+        const p0 = goertzelPower(windowSamples, FREQ_ZERO, SAMPLE_RATE);
+        const bit = p1 > p0 ? 1 : 0;
+        windowSamples = [];
+        windowStart += BIT_SAMPLES;
+
+        if (bitCount === 0) {
+          if (bit !== 0) {
+            state = "hunting";
+          } else {
+            bitCount = 1;
+          }
+        } else if (bitCount <= 8) {
+          bitQueue.push(bit);
+          bitCount++;
+        } else {
+          if (bit === 1) {
+            let byte = 0;
+            for (let j = 0; j < 8; j++) byte |= bitQueue[j] << j;
+            byteBuffer.push(byte);
+            totalBytes++;
+            framingErrors = 0;
+            if (byteBuffer.length >= STREAM_BYTES) {
+              const isPortrait = byteBuffer[0] === 1;
+              log("image complete — rendering (" + (isPortrait ? "portrait" : "landscape") + ")");
+              renderImage(byteBuffer.slice(1, STREAM_BYTES), isPortrait, () => { log("render complete"); });
+              break;
+            }
+          } else {
+            framingErrors++;
+            console.warn("framing error #" + framingErrors);
+            if (framingErrors > 20) {
+              log("too many framing errors — stopping");
+              break;
+            }
+          }
+          state = "hunting";
+          bitQueue = [];
+          bitCount = 0;
+        }
+      }
     }
 
-    const dist = {};
-    gaps.forEach((g) => {
-      dist[g] = (dist[g] || 0) + 1;
-    });
-    console.log("gap distribution:", JSON.stringify(dist));
-    console.log("total crossings:", gaps.length);
+    log("WAV decode complete — " + totalBytes + " bytes decoded");
+    console.log("total bytes:", totalBytes);
   });
 // >>>>>>
