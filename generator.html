@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>FSK Signal Generator — SICAMORE</title>
+    <style>
+      body { background: #1a1a1a; color: #d2c5a0; font-family: monospace; padding: 40px; max-width: 720px; }
+      h1 { font-size: 1rem; letter-spacing: 0.2em; margin-bottom: 2em; }
+      section { border-top: 1px solid #333; padding-top: 1.5em; margin-bottom: 2em; }
+      h2 { font-size: 0.8rem; color: #888; letter-spacing: 0.1em; margin: 0 0 1em; }
+      button { background: none; border: 1px solid #d2c5a0; color: #d2c5a0; font-family: monospace; font-size: 1rem; padding: 12px 24px; cursor: pointer; display: block; margin-bottom: 1em; }
+      button:hover { background: #d2c5a0; color: #1a1a1a; }
+      button:disabled { opacity: 0.3; cursor: default; }
+      label { display: block; color: #888; font-size: 0.8rem; margin-bottom: 0.5em; }
+      input[type="file"] { color: #d2c5a0; display: block; margin-bottom: 1em; font-family: monospace; font-size: 0.8rem; }
+      input[type="range"] { width: 180px; vertical-align: middle; margin: 0 0.5em; }
+      canvas { display: block; margin: 1em 0; image-rendering: pixelated; border: 1px solid #333; }
+      pre { font-size: 0.8rem; line-height: 1.6; color: #888; }
+    </style>
+  </head>
+  <body>
+    <h1>SICAMORE — FSK SIGNAL GENERATOR</h1>
+    <p style="color:#888;font-size:0.8rem;margin-bottom:2em">
+      space=2400Hz mark=3000Hz · leader=1800Hz · 300 baud · chirp sync · row checksums · 320×192 1-bit
+    </p>
+
+    <section>
+      <h2>IMAGE</h2>
+      <label>image file (scaled to 320×192)</label>
+      <input type="file" id="image-input" accept="image/*">
+      <label>orientation
+        <select id="orientation" style="font-family:monospace;background:#1a1a1a;color:#d2c5a0;border:1px solid #555;padding:4px 8px;margin-left:0.5em">
+          <option value="0">landscape (320×192)</option>
+          <option value="1">portrait (192×320, rotated 90° CW)</option>
+        </select>
+      </label>
+      <label>threshold <input type="range" id="threshold" min="0" max="255" value="128"> <span id="threshold-val">128</span></label>
+      <canvas id="preview" width="320" height="192" style="width:640px;height:384px"></canvas>
+      <button id="image-btn" disabled>generate WAV</button>
+    </section>
+
+    <pre id="log">ready.</pre>
+
+    <script>
+      // ── CONSTANTS — must match decoder.js exactly ──────────────────
+      const SAMPLE_RATE      = 44100;
+      const BAUD_RATE        = 300;
+      const BIT_SAMPLES      = Math.round(SAMPLE_RATE / BAUD_RATE); // 147
+      const FREQ_ONE         = 3000;   // mark  — ink pixel   (10.0 exact cycles / window)
+      const FREQ_ZERO        = 2400;   // space — bg pixel    ( 8.0 exact cycles / window)
+      const LEADER_FREQ      = 1800;   // distinct from data tones; confirmed on phone speaker
+      const LEADER_SECS      = 7;
+      const CHIRP_START_FREQ = 500;
+      const CHIRP_END_FREQ   = 4000;
+      const CHIRP_DURATION_S = 0.25;
+      const CHIRP_SAMPLES    = Math.round(CHIRP_DURATION_S * SAMPLE_RATE); // 11025
+      const IMG_WIDTH        = 320;
+      const IMG_HEIGHT       = 192;
+      const ROW_BITS         = IMG_WIDTH;
+      const CHECKSUM_BITS    = 8;
+
+      // ── logging ───────────────────────────────────────────────────
+      const logEl = document.getElementById("log");
+      const log   = msg => { logEl.textContent += "\n" + msg; };
+
+      // ── image conversion ──────────────────────────────────────────
+      let pixelBits = null; // flat array of IMG_WIDTH × IMG_HEIGHT bits, row-major MSB-first
+
+      const offscreen = document.createElement("canvas");
+      offscreen.width  = IMG_WIDTH;
+      offscreen.height = IMG_HEIGHT;
+      const offCtx = offscreen.getContext("2d");
+
+      const preview = document.getElementById("preview");
+      const prevCtx = preview.getContext("2d");
+
+      function renderPreview(threshold) {
+        const src = offCtx.getImageData(0, 0, IMG_WIDTH, IMG_HEIGHT);
+        const out  = prevCtx.createImageData(IMG_WIDTH, IMG_HEIGHT);
+        pixelBits  = new Array(IMG_WIDTH * IMG_HEIGHT);
+
+        for (let row = 0; row < IMG_HEIGHT; row++) {
+          for (let x = 0; x < IMG_WIDTH; x++) {
+            const idx  = (row * IMG_WIDTH + x) * 4;
+            const luma = src.data[idx] * 0.299 + src.data[idx+1] * 0.587 + src.data[idx+2] * 0.114;
+            const ink  = luma < threshold ? 1 : 0;
+            pixelBits[row * IMG_WIDTH + x] = ink;
+            const c = ink ? 26 : 210;
+            out.data[idx]   = c;
+            out.data[idx+1] = ink ? 26 : 197;
+            out.data[idx+2] = ink ? 26 : 160;
+            out.data[idx+3] = 255;
+          }
+        }
+        prevCtx.putImageData(out, 0, 0);
+        document.getElementById("image-btn").disabled = false;
+      }
+
+      document.getElementById("image-input").addEventListener("change", function(e) {
+        const file = e.target.files[0];
+        if (!file) return;
+        const img = new Image();
+        img.onload = () => {
+          offCtx.fillStyle = "#ffffff";
+          offCtx.fillRect(0, 0, IMG_WIDTH, IMG_HEIGHT);
+          const scale = Math.min(IMG_WIDTH / img.width, IMG_HEIGHT / img.height);
+          const w = img.width * scale, h = img.height * scale;
+          offCtx.drawImage(img, (IMG_WIDTH - w) / 2, (IMG_HEIGHT - h) / 2, w, h);
+          renderPreview(parseInt(document.getElementById("threshold").value));
+          URL.revokeObjectURL(img.src);
+        };
+        img.src = URL.createObjectURL(file);
+      });
+
+      document.getElementById("threshold").addEventListener("input", function() {
+        document.getElementById("threshold-val").textContent = this.value;
+        if (pixelBits) renderPreview(parseInt(this.value));
+      });
+
+      // ── checksum ─────────────────────────────────────────────────
+      // Must match decoder.js computeRowChecksum exactly.
+      function rowChecksum(rowBits) {
+        let cs = 0;
+        for (let i = 0; i < 40; i++) {
+          let byte = 0;
+          for (let b = 0; b < 8; b++) byte = (byte << 1) | rowBits[i * 8 + b];
+          cs ^= byte;
+        }
+        return cs;
+      }
+
+      // ── FSK sample generation ─────────────────────────────────────
+      function fskBits(bits) {
+        // Each bit → exactly BIT_SAMPLES sine samples at FREQ_ONE or FREQ_ZERO.
+        // Phase is continuous across bits.
+        const out = [];
+        let phase = 0;
+        for (const bit of bits) {
+          const freq = bit ? FREQ_ONE : FREQ_ZERO;
+          const step = (2 * Math.PI * freq) / SAMPLE_RATE;
+          for (let s = 0; s < BIT_SAMPLES; s++) {
+            out.push(Math.sin(phase));
+            phase += step;
+          }
+        }
+        return out;
+      }
+
+      function leaderSamples() {
+        const out  = [];
+        const step = (2 * Math.PI * LEADER_FREQ) / SAMPLE_RATE;
+        let phase  = 0;
+        for (let i = 0; i < Math.round(SAMPLE_RATE * LEADER_SECS); i++) {
+          out.push(Math.sin(phase));
+          phase += step;
+        }
+        return out;
+      }
+
+      function chirpSamples() {
+        const out = [];
+        let phase = 0;
+        for (let i = 0; i < CHIRP_SAMPLES; i++) {
+          const t    = i / SAMPLE_RATE;
+          const freq = CHIRP_START_FREQ + (CHIRP_END_FREQ - CHIRP_START_FREQ) * (t / CHIRP_DURATION_S);
+          out.push(Math.sin(phase));
+          phase += (2 * Math.PI * freq) / SAMPLE_RATE;
+        }
+        return out;
+      }
+
+      // ── WAV builder ───────────────────────────────────────────────
+      function samplesToWav(samples) {
+        const dataSize = samples.length * 2;
+        const buf = new ArrayBuffer(44 + dataSize);
+        const v   = new DataView(buf);
+        const s   = (off, str) => { for (let i = 0; i < str.length; i++) v.setUint8(off+i, str.charCodeAt(i)); };
+        s(0, "RIFF"); v.setUint32(4, 36 + dataSize, true);
+        s(8, "WAVE"); s(12, "fmt ");
+        v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+        v.setUint32(24, SAMPLE_RATE, true); v.setUint32(28, SAMPLE_RATE * 2, true);
+        v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+        s(36, "data"); v.setUint32(40, dataSize, true);
+        for (let i = 0; i < samples.length; i++)
+          v.setInt16(44 + i * 2, Math.max(-1, Math.min(1, samples[i])) * 32767, true);
+        return buf;
+      }
+
+      function downloadWav(buf, name) {
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(new Blob([buf], { type: "audio/wav" }));
+        a.download = name;
+        a.click();
+      }
+
+      // ── image WAV ─────────────────────────────────────────────────
+      document.getElementById("image-btn").addEventListener("click", () => {
+        logEl.textContent = "ready.";
+        if (!pixelBits) return;
+
+        const orientationFlag = parseInt(document.getElementById("orientation").value);
+        log("orientation: " + (orientationFlag ? "portrait" : "landscape"));
+
+        // Build bit stream:
+        // [8 orientation bits MSB-first] [192 rows × (320 pixel bits + 8 checksum bits)]
+        const streamBits = [];
+
+        // Orientation byte (MSB first)
+        for (let b = 7; b >= 0; b--) streamBits.push((orientationFlag >> b) & 1);
+
+        // Rows
+        for (let row = 0; row < IMG_HEIGHT; row++) {
+          const rowBits = pixelBits.slice(row * IMG_WIDTH, (row + 1) * IMG_WIDTH);
+          for (const bit of rowBits) streamBits.push(bit);
+          // Checksum byte (MSB first)
+          const cs = rowChecksum(rowBits);
+          for (let b = 7; b >= 0; b--) streamBits.push((cs >> b) & 1);
+        }
+
+        const totalBits = streamBits.length;
+        const secs      = (totalBits / BAUD_RATE).toFixed(1);
+        log("stream: " + totalBits + " bits (" + secs + "s of pixel data)");
+
+        const allSamples = [
+          ...leaderSamples(),
+          ...chirpSamples(),
+          ...fskBits(streamBits),
+          ...new Array(Math.round(SAMPLE_RATE * 0.5)).fill(0),
+        ];
+        const totalSecs = (allSamples.length / SAMPLE_RATE).toFixed(1);
+        log("total duration: " + totalSecs + "s (~" + (totalSecs / 60).toFixed(1) + " min)");
+
+        downloadWav(samplesToWav(allSamples), "sicamore_image.wav");
+        log("done — sicamore_image.wav");
+      });
+    </script>
+  </body>
+</html>
