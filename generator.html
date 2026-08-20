@@ -64,7 +64,8 @@
       const log   = msg => { logEl.textContent += "\n" + msg; };
 
       // ── image conversion ──────────────────────────────────────────
-      let pixelBits = null; // flat array of IMG_WIDTH × IMG_HEIGHT bits, row-major MSB-first
+      let pixelBits = null;
+      let canvasW = IMG_WIDTH, canvasH = IMG_HEIGHT;
 
       const offscreen = document.createElement("canvas");
       offscreen.width  = IMG_WIDTH;
@@ -75,16 +76,21 @@
       const prevCtx = preview.getContext("2d");
 
       function renderPreview(threshold) {
-        const src = offCtx.getImageData(0, 0, IMG_WIDTH, IMG_HEIGHT);
-        const out  = prevCtx.createImageData(IMG_WIDTH, IMG_HEIGHT);
-        pixelBits  = new Array(IMG_WIDTH * IMG_HEIGHT);
+        const src = offCtx.getImageData(0, 0, canvasW, canvasH);
+        // Match preview canvas to the image's actual orientation.
+        preview.width  = canvasW;
+        preview.height = canvasH;
+        preview.style.width  = (canvasW * 2) + "px";
+        preview.style.height = (canvasH * 2) + "px";
+        const out = prevCtx.createImageData(canvasW, canvasH);
+        pixelBits = new Array(canvasW * canvasH);
 
-        for (let row = 0; row < IMG_HEIGHT; row++) {
-          for (let x = 0; x < IMG_WIDTH; x++) {
-            const idx  = (row * IMG_WIDTH + x) * 4;
+        for (let row = 0; row < canvasH; row++) {
+          for (let x = 0; x < canvasW; x++) {
+            const idx  = (row * canvasW + x) * 4;
             const luma = src.data[idx] * 0.299 + src.data[idx+1] * 0.587 + src.data[idx+2] * 0.114;
             const ink  = luma < threshold ? 1 : 0;
-            pixelBits[row * IMG_WIDTH + x] = ink;
+            pixelBits[row * canvasW + x] = ink;
             const c = ink ? 26 : 210;
             out.data[idx]   = c;
             out.data[idx+1] = ink ? 26 : 197;
@@ -101,11 +107,18 @@
         if (!file) return;
         const img = new Image();
         img.onload = () => {
+          // Auto-detect orientation: portrait if taller than wide.
+          const isPortrait = img.height > img.width;
+          document.getElementById("orientation").value = isPortrait ? "1" : "0";
+          canvasW = isPortrait ? IMG_HEIGHT : IMG_WIDTH;   // 192 or 320
+          canvasH = isPortrait ? IMG_WIDTH  : IMG_HEIGHT;  // 320 or 192
+          offscreen.width  = canvasW;
+          offscreen.height = canvasH;
           offCtx.fillStyle = "#ffffff";
-          offCtx.fillRect(0, 0, IMG_WIDTH, IMG_HEIGHT);
-          const scale = Math.min(IMG_WIDTH / img.width, IMG_HEIGHT / img.height);
+          offCtx.fillRect(0, 0, canvasW, canvasH);
+          const scale = Math.min(canvasW / img.width, canvasH / img.height);
           const w = img.width * scale, h = img.height * scale;
-          offCtx.drawImage(img, (IMG_WIDTH - w) / 2, (IMG_HEIGHT - h) / 2, w, h);
+          offCtx.drawImage(img, (canvasW - w) / 2, (canvasH - h) / 2, w, h);
           renderPreview(parseInt(document.getElementById("threshold").value));
           URL.revokeObjectURL(img.src);
         };
@@ -121,7 +134,8 @@
       // Must match decoder.js computeRowChecksum exactly.
       function rowChecksum(rowBits) {
         let cs = 0;
-        for (let i = 0; i < 40; i++) {
+        const numBytes = rowBits.length / 8; // 40 for landscape rows, 24 for portrait rows
+        for (let i = 0; i < numBytes; i++) {
           let byte = 0;
           for (let b = 0; b < 8; b++) byte = (byte << 1) | rowBits[i * 8 + b];
           cs ^= byte;
@@ -202,15 +216,16 @@
         log("orientation: " + (orientationFlag ? "portrait" : "landscape"));
 
         // Build bit stream:
-        // [8 orientation bits MSB-first] [192 rows × (320 pixel bits + 8 checksum bits)]
+        // [8 orientation bits MSB-first] [numRows × (rowWidth pixel bits + 8 checksum bits)]
+        // Landscape: 192 rows × 320 bits. Portrait: 320 rows × 192 bits.
         const streamBits = [];
 
         // Orientation byte (MSB first)
         for (let b = 7; b >= 0; b--) streamBits.push((orientationFlag >> b) & 1);
 
-        // Rows
-        for (let row = 0; row < IMG_HEIGHT; row++) {
-          const rowBits = pixelBits.slice(row * IMG_WIDTH, (row + 1) * IMG_WIDTH);
+        // Rows — canvasW/canvasH are set at load time to match the image's orientation
+        for (let row = 0; row < canvasH; row++) {
+          const rowBits = pixelBits.slice(row * canvasW, (row + 1) * canvasW);
           for (const bit of rowBits) streamBits.push(bit);
           // Checksum byte (MSB first)
           const cs = rowChecksum(rowBits);

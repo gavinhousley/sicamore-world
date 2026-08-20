@@ -121,8 +121,10 @@ function setupCanvas(isPortrait) {
     canvas.id = "decode-canvas";
     document.getElementById("waste").appendChild(canvas);
   }
-  canvas.width = (isPortrait ? IMG_HEIGHT : IMG_WIDTH) * DISPLAY_SCALE;
-  canvas.height = (isPortrait ? IMG_WIDTH : IMG_HEIGHT) * DISPLAY_SCALE;
+  // Portrait: 192 wide × 320 tall (matches the source image dimensions directly).
+  // Landscape: 320 wide × 192 tall.
+  canvas.width  = (isPortrait ? IMG_HEIGHT : IMG_WIDTH)  * DISPLAY_SCALE;
+  canvas.height = (isPortrait ? IMG_WIDTH  : IMG_HEIGHT) * DISPLAY_SCALE;
   canvas.style.imageRendering = "pixelated";
   const ctx2d = canvas.getContext("2d");
   ctx2d.fillStyle = BG_COLOUR;
@@ -133,44 +135,19 @@ function setupCanvas(isPortrait) {
 // ── ROW RENDERING ────────────────────────────────────────────
 
 function drawRow(ctx2d, rowPixels, rowIndex, isPortrait) {
-  for (let x = 0; x < IMG_WIDTH; x++) {
+  // Portrait: 320 rows × 192 pixels drawn directly to a 192-wide × 320-tall canvas.
+  // Landscape: 192 rows × 320 pixels drawn to a 320-wide × 192-tall canvas.
+  // Same draw logic either way — orientation only affects canvas dimensions.
+  for (let x = 0; x < rowPixels.length; x++) {
     ctx2d.fillStyle = rowPixels[x] ? INK_COLOUR : BG_COLOUR;
-    if (isPortrait) {
-      ctx2d.fillRect(
-        (IMG_HEIGHT - 1 - rowIndex) * DISPLAY_SCALE,
-        x * DISPLAY_SCALE,
-        DISPLAY_SCALE,
-        DISPLAY_SCALE,
-      );
-    } else {
-      ctx2d.fillRect(
-        x * DISPLAY_SCALE,
-        rowIndex * DISPLAY_SCALE,
-        DISPLAY_SCALE,
-        DISPLAY_SCALE,
-      );
-    }
+    ctx2d.fillRect(x * DISPLAY_SCALE, rowIndex * DISPLAY_SCALE, DISPLAY_SCALE, DISPLAY_SCALE);
   }
 }
 
-function drawGlitchRow(ctx2d, rowIndex, isPortrait) {
-  for (let x = 0; x < IMG_WIDTH; x++) {
+function drawGlitchRow(ctx2d, rowIndex, rowWidth) {
+  for (let x = 0; x < rowWidth; x++) {
     ctx2d.fillStyle = Math.random() > 0.5 ? INK_COLOUR : BG_COLOUR;
-    if (isPortrait) {
-      ctx2d.fillRect(
-        (IMG_HEIGHT - 1 - rowIndex) * DISPLAY_SCALE,
-        x * DISPLAY_SCALE,
-        DISPLAY_SCALE,
-        DISPLAY_SCALE,
-      );
-    } else {
-      ctx2d.fillRect(
-        x * DISPLAY_SCALE,
-        rowIndex * DISPLAY_SCALE,
-        DISPLAY_SCALE,
-        DISPLAY_SCALE,
-      );
-    }
+    ctx2d.fillRect(x * DISPLAY_SCALE, rowIndex * DISPLAY_SCALE, DISPLAY_SCALE, DISPLAY_SCALE);
   }
 }
 
@@ -179,7 +156,8 @@ function drawGlitchRow(ctx2d, rowIndex, isPortrait) {
 
 function computeRowChecksum(rowPixels) {
   let checksum = 0;
-  for (let i = 0; i < 40; i++) {
+  const numBytes = rowPixels.length / 8; // 40 for landscape, 24 for portrait
+  for (let i = 0; i < numBytes; i++) {
     let byte = 0;
     for (let b = 0; b < 8; b++) byte = (byte << 1) | rowPixels[i * 8 + b];
     checksum ^= byte;
@@ -289,20 +267,30 @@ function startDecodeEngine(
   // Bit-reading state
   let state = "chirp"; // "chirp" | "bits"
 
-  const bitWindow = new Float32Array(bitSamples);
-  let bitFill = 0;
+  // Zero-crossing bit-clock recovery: at each bit boundary, find the nearest
+  // zero crossing within ±BIT_SEARCH samples and align to it. This tracks
+  // speaker-vs-mic clock drift continuously so timing errors can't accumulate.
+  const BIT_SEARCH = 5;
+  const bitBuffer = new Float32Array(bitSamples * 3);
+  let bitBufferLen = 0;
+  let bitsProcessed = 0;
   let bitCount = 0; // diagnostic: log first N bits
+
+  // Peak-track chirp lock: hold through the correlation peak, lock at the true maximum.
+  let peakCorr = 0, peakHold = 0;
 
   let orientationBits = [];
   let isPortrait = false;
   let ctx2d = null;
 
   let currentRow = 0;
-  const rowPixels = new Array(IMG_WIDTH);
+  let rowPixels = null; // sized after orientation byte: 320 (landscape) or 192 (portrait)
+  let rowWidth = IMG_WIDTH;
+  let numRows = IMG_HEIGHT;
   let rowPixelCount = 0;
   const rowCsumBits = [];
   let consecutiveGlitch = 0;
-  const SIGNAL_LOST_ROWS = 10; // ~11s of pure noise → give up and re-listen
+  const SIGNAL_LOST_ROWS = 20; // ~22s of pure noise → give up and re-listen
 
   function processBit(bit) {
     // Phase 1: collect 8 orientation bits
@@ -312,6 +300,10 @@ function startDecodeEngine(
         let val = 0;
         for (let b = 0; b < 8; b++) val = (val << 1) | orientationBits[b];
         isPortrait = val === 1;
+        // Portrait: 320 rows × 192 pixels. Landscape: 192 rows × 320 pixels.
+        rowWidth  = isPortrait ? IMG_HEIGHT : IMG_WIDTH;
+        numRows   = isPortrait ? IMG_WIDTH  : IMG_HEIGHT;
+        rowPixels = new Array(rowWidth);
         const result = setupCanvas(isPortrait);
         ctx2d = result.ctx2d;
         document.getElementById("decode-canvas").style.display = "block";
@@ -323,9 +315,9 @@ function startDecodeEngine(
     }
 
     // Phase 2: pixel rows
-    if (currentRow >= IMG_HEIGHT) return;
+    if (currentRow >= numRows) return;
 
-    if (rowPixelCount < ROW_BITS) {
+    if (rowPixelCount < rowWidth) {
       rowPixels[rowPixelCount++] = bit;
     } else {
       rowCsumBits.push(bit);
@@ -341,7 +333,7 @@ function startDecodeEngine(
           console.log("row", currentRow, "ok");
         } else {
           console.warn("row", currentRow, "GLITCH — expected", expected, "got", received);
-          drawGlitchRow(ctx2d, currentRow, isPortrait);
+          drawGlitchRow(ctx2d, currentRow, rowWidth);
           consecutiveGlitch++;
           if (onSignalLost && consecutiveGlitch >= SIGNAL_LOST_ROWS) {
             try { processor.disconnect(); } catch (_) {}
@@ -355,7 +347,7 @@ function startDecodeEngine(
         rowPixelCount = 0;
         rowCsumBits.length = 0;
 
-        if (currentRow >= IMG_HEIGHT) {
+        if (currentRow >= numRows) {
           try {
             processor.disconnect();
           } catch (_) {}
@@ -385,27 +377,67 @@ function startDecodeEngine(
         if (ringFull && sampleCount % CHIRP_CHECK_STRIDE === 0) {
           const corr = correlate();
           if (corr > CHIRP_THRESHOLD) {
-            // First threshold crossing locks the bit clock.
-            // With stride=8 and a 9-sample-wide peak, the error is < 8 samples (< 6% of a bit).
+            if (corr > peakCorr) { peakCorr = corr; peakHold = 0; }
+            else if (++peakHold >= 3) {
+              state = "bits";
+              bitBufferLen = 0;
+              log("sync locked — receiving pixels...");
+              console.log("chirp corr:", peakCorr.toFixed(3));
+            }
+          } else if (peakCorr > 0 && ++peakHold >= 3) {
             state = "bits";
-            bitFill = 0;
+            bitBufferLen = 0;
             log("sync locked — receiving pixels...");
-            console.log("chirp corr:", corr.toFixed(3));
+            console.log("chirp corr:", peakCorr.toFixed(3));
           }
         }
       } else {
-        // "bits"
-        bitWindow[bitFill++] = sample;
+        // "bits" — accumulate into rolling buffer, extract bits as available
+        bitBuffer[bitBufferLen++] = sample;
 
-        if (bitFill === bitSamples) {
-          const p1 = goertzelPower(bitWindow, FREQ_ONE, actualRate);
-          const p0 = goertzelPower(bitWindow, FREQ_ZERO, actualRate);
+        while (true) {
+          const needFirstBit = bitsProcessed === 0;
+          const needed = needFirstBit ? bitSamples : bitSamples + 2 * BIT_SEARCH;
+          if (bitBufferLen < needed) break;
+
+          let bitStart;
+          if (needFirstBit) {
+            bitStart = 0;
+          } else {
+            // Find zero crossing nearest to expected bit start (index BIT_SEARCH)
+            bitStart = BIT_SEARCH;
+            let minDist = BIT_SEARCH + 1;
+            for (let j = 1; j <= 2 * BIT_SEARCH; j++) {
+              const rising  = bitBuffer[j - 1] <= 0 && bitBuffer[j] > 0;
+              const falling = bitBuffer[j - 1] >= 0 && bitBuffer[j] < 0;
+              if (rising || falling) {
+                const dist = Math.abs(j - BIT_SEARCH);
+                if (dist < minDist) { minDist = dist; bitStart = j; }
+              }
+            }
+          }
+
+          const window = bitBuffer.subarray(bitStart, bitStart + bitSamples);
+          const p1 = goertzelPower(window, FREQ_ONE, actualRate);
+          const p0 = goertzelPower(window, FREQ_ZERO, actualRate);
           if (bitCount < 10) {
-            console.log("bit", bitCount, "p1:", p1.toFixed(1), "p0:", p0.toFixed(1), "→", p1 > p0 ? 1 : 0);
+            const alignOff = needFirstBit ? 0 : bitStart - BIT_SEARCH;
+            console.log("bit", bitCount, "p1:", p1.toFixed(1), "p0:", p0.toFixed(1),
+                        "align:", alignOff, "→", p1 > p0 ? 1 : 0);
             bitCount++;
           }
           processBit(p1 > p0 ? 1 : 0);
-          bitFill = 0;
+          bitsProcessed++;
+
+          // Consume samples up to end of bit window, leaving BIT_SEARCH samples
+          // as backward-search context for the next bit boundary.
+          const consumed = bitStart + bitSamples - BIT_SEARCH;
+          if (consumed > 0 && consumed < bitBufferLen) {
+            bitBuffer.copyWithin(0, consumed, bitBufferLen);
+            bitBufferLen -= consumed;
+          } else if (consumed >= bitBufferLen) {
+            bitBufferLen = 0;
+          }
         }
       }
     }
@@ -429,6 +461,15 @@ async function startListening() {
       autoGainControl: false,
       channelCount: 1,
     },
+  });
+
+  stream.getAudioTracks().forEach(track => {
+    track.onended = () => {
+      log("microphone interrupted — reconnecting...");
+      // Close the dead context and restart the whole listening chain.
+      if (audioCtx) { audioCtx.close(); audioCtx = null; }
+      setTimeout(startListening, 500);
+    };
   });
 
   audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
@@ -603,14 +644,32 @@ document
     // ── Read bits from chirp end ──
     let pos = chirpEnd;
 
+    let firstBit = true;
     function readBit() {
-      if (pos + wavBitSamples > samples.length) return 0;
-      const window = samples.subarray(pos, pos + wavBitSamples);
-      pos += wavBitSamples;
+      const BIT_SEARCH = 5;
+      let start;
+      if (firstBit) {
+        start = pos;
+        firstBit = false;
+      } else {
+        start = pos;
+        let minDist = BIT_SEARCH + 1;
+        for (let offset = -BIT_SEARCH; offset <= BIT_SEARCH; offset++) {
+          const i = pos + offset;
+          if (i < 1 || i >= samples.length) continue;
+          const rising  = samples[i - 1] <= 0 && samples[i] > 0;
+          const falling = samples[i - 1] >= 0 && samples[i] < 0;
+          if (rising || falling) {
+            const dist = Math.abs(offset);
+            if (dist < minDist) { minDist = dist; start = pos + offset; }
+          }
+        }
+      }
+      if (start + wavBitSamples > samples.length) return 0;
+      const window = samples.subarray(start, start + wavBitSamples);
+      pos = start + wavBitSamples;
       return goertzelPower(window, FREQ_ONE, actualRate) >
-        goertzelPower(window, FREQ_ZERO, actualRate)
-        ? 1
-        : 0;
+        goertzelPower(window, FREQ_ZERO, actualRate) ? 1 : 0;
     }
 
     // Orientation byte
@@ -619,17 +678,20 @@ document
     const isPortrait = val === 1;
     console.log("orientation:", isPortrait ? "portrait" : "landscape");
 
+    // Portrait: 320 rows × 192 pixels. Landscape: 192 rows × 320 pixels.
+    const rowWidth = isPortrait ? IMG_HEIGHT : IMG_WIDTH;
+    const numRows  = isPortrait ? IMG_WIDTH  : IMG_HEIGHT;
+
     const { ctx2d } = setupCanvas(isPortrait);
     document.getElementById("decode-canvas").style.display = "block";
     const decoderImg = document.getElementById("decoder");
     if (decoderImg) decoderImg.style.display = "none";
 
-    // Rows
-    const rowPixels = new Array(IMG_WIDTH);
+    const rowPixels = new Array(rowWidth);
     let glitchCount = 0;
 
-    for (let row = 0; row < IMG_HEIGHT; row++) {
-      for (let x = 0; x < IMG_WIDTH; x++) rowPixels[x] = readBit();
+    for (let row = 0; row < numRows; row++) {
+      for (let x = 0; x < rowWidth; x++) rowPixels[x] = readBit();
 
       let received = 0;
       for (let b = 0; b < 8; b++) received = (received << 1) | readBit();
@@ -638,7 +700,7 @@ document
       if (received === expected) {
         drawRow(ctx2d, rowPixels, row, isPortrait);
       } else {
-        drawGlitchRow(ctx2d, row, isPortrait);
+        drawGlitchRow(ctx2d, row, rowWidth);
         glitchCount++;
       }
     }
